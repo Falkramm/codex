@@ -998,12 +998,14 @@ enabled = true
 reminder_interval_seconds = 0
 clock_source = "external"
 delivery_mode = "after_user_or_tool_output"
+include_conversation_timing = true
 sleep_tool = true
 "#,
             CurrentTimeReminderConfig {
                 reminder_interval_seconds: 0,
                 clock_source: CurrentTimeSource::External,
                 delivery_mode: CurrentTimeReminderDeliveryMode::AfterUserOrToolOutput,
+                include_conversation_timing: true,
                 sleep_tool: true,
             },
         ),
@@ -1012,6 +1014,28 @@ sleep_tool = true
         assert!(config.features.enabled(Feature::CurrentTimeReminder));
         assert_eq!(config.current_time_reminder, Some(expected));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_supports_opt_in_conversation_timing() -> std::io::Result<()> {
+    for (setting, expected) in [
+        ("include_conversation_timing = true", true),
+        ("include_conversation_timing = false", false),
+        ("", false),
+    ] {
+        let config_toml = format!("[features.current_time_reminder]\nenabled = true\n{setting}\n");
+        let config = load_current_time_reminder_config(&config_toml).await?;
+        let resolved = serde_json::to_value(config.current_time_reminder)
+            .expect("current-time reminder configuration should serialize");
+        assert_eq!(resolved["include_conversation_timing"], expected);
+    }
+
+    let disabled = load_current_time_reminder_config(
+        "[features.current_time_reminder]\nenabled = false\ninclude_conversation_timing = true\n",
+    )
+    .await?;
+    assert_eq!(disabled.current_time_reminder, None);
     Ok(())
 }
 

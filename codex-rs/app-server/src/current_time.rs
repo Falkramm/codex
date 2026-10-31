@@ -9,6 +9,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::CurrentTimeReadParams;
 use codex_app_server_protocol::CurrentTimeReadResponse;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_core::SleepFuture;
 use codex_core::TimeFuture;
@@ -38,6 +39,40 @@ pub(crate) fn app_server_time_provider(
 struct AppServerTimeProvider {
     outgoing: Weak<OutgoingMessageSender>,
     thread_state_manager: ThreadStateManager,
+}
+
+/// Optional callers can stop waiting before the provider's own timeout. Keep
+/// callback cleanup alive even when they drop the request during a queue wait.
+struct CurrentTimeRequestGuard {
+    outgoing: Arc<OutgoingMessageSender>,
+    request_id: Option<RequestId>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl CurrentTimeRequestGuard {
+    fn new(outgoing: Arc<OutgoingMessageSender>, request_id: RequestId) -> Self {
+        Self {
+            outgoing,
+            request_id: Some(request_id),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for CurrentTimeRequestGuard {
+    fn drop(&mut self) {
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        let outgoing = Arc::clone(&self.outgoing);
+        self.runtime.spawn(async move {
+            outgoing.cancel_request(&request_id).await;
+        });
+    }
 }
 
 impl TimeProvider for AppServerTimeProvider {
@@ -104,8 +139,11 @@ async fn request_current_time(
         .await;
     let connection_id = require_single_current_time_connection(&connection_ids)?;
     let connection_ids = [connection_id];
-    let (request_id, rx) = outgoing
-        .send_request_to_connections(
+    let request_id = outgoing.next_request_id();
+    let mut request_guard = CurrentTimeRequestGuard::new(Arc::clone(&outgoing), request_id.clone());
+    let (_, rx) = outgoing
+        .send_request_to_connections_with_id(
+            request_id.clone(),
             Some(&connection_ids),
             ServerRequestPayload::CurrentTimeRead(CurrentTimeReadParams {
                 thread_id: thread_id.to_string(),
@@ -114,7 +152,12 @@ async fn request_current_time(
         )
         .await;
 
-    let result = match timeout_at(deadline, rx).await {
+    let response = timeout_at(deadline, rx).await;
+    if response.is_err() {
+        outgoing.cancel_request(&request_id).await;
+    }
+    request_guard.disarm();
+    let result = match response {
         Ok(Ok(Ok(result))) => result,
         Ok(Ok(Err(err))) => {
             bail!(
@@ -125,7 +168,6 @@ async fn request_current_time(
         }
         Ok(Err(err)) => bail!("current-time request was canceled: {err}"),
         Err(_) => {
-            let _canceled = outgoing.cancel_request(&request_id).await;
             bail!(
                 "current-time request timed out after {}s",
                 CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
@@ -152,8 +194,64 @@ fn require_single_current_time_connection(connection_ids: &[ConnectionId]) -> Re
 
 #[cfg(test)]
 mod tests {
+    use super::request_current_time;
     use super::require_single_current_time_connection;
     use crate::outgoing_message::ConnectionId;
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
+    use crate::outgoing_message::OutgoingMessageSender;
+    use crate::thread_state::ConnectionCapabilities;
+    use crate::thread_state::ThreadStateManager;
+    use codex_protocol::ThreadId;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn dropping_current_time_request_removes_pending_callback() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_state_manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(7);
+        thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, connection_id)
+                .await
+        );
+        let mut request = Box::pin(request_current_time(
+            Arc::clone(&outgoing),
+            thread_state_manager,
+            thread_id,
+        ));
+        assert!(futures::poll!(&mut request).is_pending());
+        let OutgoingEnvelope::ToConnection {
+            connection_id: recipient,
+            message: OutgoingMessage::Request(sent),
+            ..
+        } = rx
+            .try_recv()
+            .expect("the clock request must have been sent")
+        else {
+            panic!("expected a clock request to the subscribed connection");
+        };
+        assert_eq!(recipient, connection_id);
+        let request_id = sent.id().clone();
+
+        // Optional clock capture can time out before the provider's own deadline.
+        // Dropping its future must not leave a callback waiting for a late client.
+        drop(request);
+        tokio::task::yield_now().await;
+        assert!(
+            !outgoing.cancel_request(&request_id).await,
+            "dropping the clock future must remove its pending callback"
+        );
+    }
 
     #[test]
     fn current_time_connection_must_be_unambiguous() {

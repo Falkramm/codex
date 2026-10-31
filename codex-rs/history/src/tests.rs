@@ -8,6 +8,43 @@ use serde_json::json;
 
 use super::*;
 
+#[test]
+fn response_item_envelope_preserves_conversation_timing() -> Result<()> {
+    for clock_source in ["system", "external"] {
+        for completed_at_ms in [Some(1_793_448_240_000_i64), None] {
+            let timing = json!({
+                "clock_source": clock_source,
+                "last_user_message": {
+                    "message_id": "user-1",
+                    "at_ms": 1_793_448_000_000_i64,
+                },
+                "last_assistant_message": {
+                    "message_id": "assistant-1",
+                    "at_ms": completed_at_ms,
+                },
+            });
+            let payload = response_message("assistant");
+            let persisted = json!({
+                "type": "response_item",
+                "payload": payload,
+                "metadata": {
+                    "conversation_timing": timing,
+                },
+            });
+
+            let restored: RolloutItem = serde_json::from_value(persisted)?;
+            let rewritten = serde_json::to_value(restored)?;
+
+            // A cold resume/rewrite must retain the original clock and completion time,
+            // including an explicit unknown time when reading the clock failed.
+            assert_eq!(rewritten["metadata"]["conversation_timing"], timing);
+            assert_eq!(rewritten["payload"], serde_json::to_value(payload)?);
+            assert_eq!(rewritten["payload"].get("conversation_timing"), None);
+        }
+    }
+    Ok(())
+}
+
 fn thread_settings_snapshot(disabled_plugin_ids: Vec<String>) -> Result<ThreadSettingsSnapshot> {
     Ok(serde_json::from_value(json!({
         "model": "gpt-5",

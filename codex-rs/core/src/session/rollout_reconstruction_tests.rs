@@ -31,6 +31,249 @@ use std::path::PathBuf;
 use test_case::test_case;
 use uuid::Uuid;
 
+fn timed_conversation_turn(
+    user_id: &str,
+    assistant_id: &str,
+    recorded_at_ms: i64,
+) -> Vec<ResponseItemEnvelope> {
+    let user_timing = codex_history::ConversationMessageTiming {
+        message_id: Some(user_id.to_string()),
+        at_ms: Some(recorded_at_ms),
+    };
+    let mut snapshot = codex_history::ConversationTiming {
+        clock_source: "system".to_string(),
+        last_user_message: Some(user_timing),
+        last_assistant_message: None,
+    };
+    let mut user = user_message("Compare the options.");
+    user.set_id(Some(codex_protocol::ResponseItemId::from_server(
+        user_id.to_string(),
+    )));
+    let user = ResponseItemEnvelope {
+        item: user,
+        metadata: Some(codex_history::CodexHarnessMetadata {
+            conversation_timing: Some(snapshot.clone()),
+            ..Default::default()
+        }),
+    };
+    snapshot.last_assistant_message = Some(codex_history::ConversationMessageTiming {
+        message_id: Some(assistant_id.to_string()),
+        at_ms: Some(recorded_at_ms + 240_000),
+    });
+    let mut assistant = assistant_message("Which option would you prefer?");
+    assistant.set_id(Some(codex_protocol::ResponseItemId::from_server(
+        assistant_id.to_string(),
+    )));
+    vec![
+        user,
+        ResponseItemEnvelope {
+            item: assistant,
+            metadata: Some(codex_history::CodexHarnessMetadata {
+                conversation_timing: Some(snapshot),
+                ..Default::default()
+            }),
+        },
+    ]
+}
+
+fn enable_conversation_timing(turn: &mut TurnContext) {
+    let config = Arc::make_mut(&mut turn.config);
+    config
+        .features
+        .enable(Feature::CurrentTimeReminder)
+        .expect("test config allows current-time reminders");
+    config.current_time_reminder = Some(crate::config::CurrentTimeReminderConfig {
+        include_conversation_timing: true,
+        reminder_interval_seconds: 0,
+        clock_source: codex_features::CurrentTimeSource::System,
+        ..Default::default()
+    });
+}
+
+async fn visible_conversation_timing(session: &Session, turn: &TurnContext) -> serde_json::Value {
+    super::time_reminder::maybe_record_current_time_reminder(session, turn, "timing-replay")
+        .await
+        .expect("record temporal context for the next inference");
+    let history = session.clone_history().await;
+    for envelope in history.annotated_items().iter().rev() {
+        if let ResponseItem::Message { role, content, .. } = &envelope.item
+            && role == "developer"
+        {
+            for part in content {
+                if let ContentItem::InputText { text } = part
+                    && let Some((_, body)) = text.split_once("<conversation_timing>")
+                {
+                    let (body, _) = body
+                        .split_once("</conversation_timing>")
+                        .expect("complete timing fragment");
+                    return serde_json::from_str(body).expect("structured timing context");
+                }
+            }
+        }
+    }
+    panic!("the next inference must receive conversation timing");
+}
+
+fn assert_visible_message_time(
+    context: &serde_json::Value,
+    field: &str,
+    message_id: &str,
+    at_ms: i64,
+) {
+    assert_eq!(context[field]["message_id"], json!(message_id));
+    let recorded = context[field]["at"]
+        .as_str()
+        .expect("known message time must be visible");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(recorded)
+            .expect("unambiguous timestamp")
+            .timestamp_millis(),
+        at_ms
+    );
+}
+
+#[test_case(false; "cold resume")]
+#[test_case(true; "fork")]
+#[tokio::test]
+async fn conversation_timing_replay_discards_rolled_back_completion(fork: bool) {
+    let (session, mut turn) = make_session_and_context().await;
+    let recorded_at_ms = chrono::Utc::now().timestamp_millis() - 1_000_000;
+    let items = timed_conversation_turn("kept-user", "kept-answer", recorded_at_ms)
+        .into_iter()
+        .chain(timed_conversation_turn(
+            "removed-user",
+            "removed-answer",
+            recorded_at_ms + 500_000,
+        ))
+        .map(RolloutItem::ResponseItem)
+        .chain(std::iter::once(RolloutItem::EventMsg(
+            EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+        )))
+        .collect::<Vec<_>>();
+    let saved: Vec<RolloutItem> =
+        serde_json::from_value(serde_json::to_value(items).unwrap()).unwrap();
+    let initial = if fork {
+        InitialHistory::Forked(saved)
+    } else {
+        InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.thread_id,
+            history: Arc::new(saved),
+            history_revision: None,
+            rollout_path: None,
+        })
+    };
+    session.record_initial_history(initial).await;
+    enable_conversation_timing(&mut turn);
+
+    let visible = visible_conversation_timing(&session, &turn).await;
+    assert_visible_message_time(
+        &visible,
+        "last_user_message_recorded",
+        "kept-user",
+        recorded_at_ms,
+    );
+    assert_visible_message_time(
+        &visible,
+        "last_assistant_message_completed",
+        "kept-answer",
+        recorded_at_ms + 240_000,
+    );
+    assert!(!visible.to_string().contains("removed-answer"));
+}
+
+#[tokio::test]
+async fn conversation_timing_prefix_compaction_does_not_checkpoint_future_suffix() {
+    let (session, mut turn) = make_session_and_context().await;
+    let recorded_at_ms = chrono::Utc::now().timestamp_millis() - 1_000_000;
+    session
+        .record_annotated_conversation_items(
+            &turn,
+            turn.model_info(),
+            timed_conversation_turn("prefix-user", "prefix-answer", recorded_at_ms),
+        )
+        .await;
+    let history = session.clone_history().await;
+    let prefix = CompactionPrefix {
+        generation: history.history_version(),
+        len: history.annotated_items().len(),
+        auth_owner_generation: session.services.model_client.auth_owner_generation(),
+    };
+    // This turn arrives while prefix compaction is in progress. Its timing must stay
+    // in the live suffix so rolling that turn back also removes its completion time.
+    session
+        .record_annotated_conversation_items(
+            &turn,
+            turn.model_info(),
+            timed_conversation_turn("suffix-user", "suffix-answer", recorded_at_ms + 500_000),
+        )
+        .await;
+    enable_conversation_timing(&mut turn);
+    let summary = ResponseItemEnvelope::new(ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "summary of the first turn".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    assert!(
+        session
+            .replace_compacted_history(
+                vec![summary],
+                turn.to_turn_context_item(),
+                Default::default(),
+                CompactedHistoryInstallation::Prefix {
+                    prefix,
+                    prefix_context: Vec::new(),
+                    initial_context: Vec::new(),
+                    model_info: turn.model_info(),
+                    compaction_response_id: "prefix-compaction".to_string(),
+                    reviewer_compaction_hash: None,
+                    turn_context: &turn,
+                    started_item: None,
+                },
+            )
+            .await
+    );
+
+    let replacement = session.clone_history().await.into_annotated_items();
+    let mut compacted: CompactedItem = serde_json::from_value(json!({
+        "message": "prefix summary",
+        "window_number": 1,
+        "resume_metadata": {},
+    }))
+    .expect("persist a current compaction checkpoint");
+    compacted.replacement_history = Some(replacement);
+    let saved = vec![
+        RolloutItem::Compacted(Box::new(compacted)),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ];
+    let saved = serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+    let (resumed, mut resumed_turn) = make_session_and_context().await;
+    resumed
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: resumed.thread_id,
+            history: Arc::new(saved),
+            history_revision: None,
+            rollout_path: None,
+        }))
+        .await;
+    enable_conversation_timing(&mut resumed_turn);
+    let visible = visible_conversation_timing(&resumed, &resumed_turn).await;
+    assert_visible_message_time(
+        &visible,
+        "last_assistant_message_completed",
+        "prefix-answer",
+        recorded_at_ms + 240_000,
+    );
+    assert_visible_message_time(
+        &visible,
+        "last_user_message_recorded",
+        "prefix-user",
+        recorded_at_ms,
+    );
+    assert!(!visible.to_string().contains("suffix-answer"));
+}
+
 #[tokio::test]
 async fn recorded_questions_share_queued_input_order_across_resume() {
     let (session, turn) = make_session_and_context().await;

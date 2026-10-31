@@ -15,6 +15,10 @@ pub use compaction_resume_metadata::resume_multi_agent_version;
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
 
+mod conversation_timing;
+pub use conversation_timing::ConversationMessageTiming;
+pub use conversation_timing::ConversationTiming;
+
 mod initialization;
 pub use initialization::HistoryInitialization;
 
@@ -66,6 +70,11 @@ pub struct ResponseItemEnvelope {
 ///
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
+    /// Cumulative message timing, retained by the harness for temporal context.
+    /// Absent on older history and sessions that have never enabled conversation timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_timing: Option<ConversationTiming>,
+
     /// Complete retained records actually delivered by this Guardian message. Host-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guardian_sources: Vec<RetainedSource>,

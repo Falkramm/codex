@@ -96,12 +96,8 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
     finalized_facts: Option<&FinalizedTurnItemFacts>,
 ) {
     let turn_context = &step_context.turn;
-    sess.record_conversation_items(
-        turn_context,
-        &step_context.settings.model_info,
-        std::slice::from_ref(item),
-    )
-    .await;
+    sess.record_completed_model_item(turn_context, &step_context.settings.model_info, item)
+        .await;
     if turn_context.config.otel.agent_response_logging_enabled() {
         turn_context
             .extension_data

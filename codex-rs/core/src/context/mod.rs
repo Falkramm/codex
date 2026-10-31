@@ -8,6 +8,7 @@ mod base_instructions;
 mod compaction_summary;
 mod content_filter_guidance;
 mod contextual_user_message;
+mod conversation_timing;
 mod current_time_reminder;
 mod developer_instructions;
 mod environment_context;

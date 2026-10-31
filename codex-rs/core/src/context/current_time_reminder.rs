@@ -1,5 +1,6 @@
 use chrono::DateTime;
 use chrono::Utc;
+use codex_history::ConversationTiming;
 
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItem;
@@ -10,11 +11,20 @@ use codex_protocol::models::input_text;
 
 pub(crate) struct CurrentTimeReminder {
     current_time: DateTime<Utc>,
+    conversation_timing: Option<ConversationTiming>,
 }
 
 impl CurrentTimeReminder {
     pub(crate) fn new(current_time: DateTime<Utc>) -> Self {
-        Self { current_time }
+        Self {
+            current_time,
+            conversation_timing: None,
+        }
+    }
+
+    pub(crate) fn with_conversation_timing(mut self, timing: ConversationTiming) -> Self {
+        self.conversation_timing = Some(timing);
+        self
     }
 
     pub(crate) fn formatted_time(&self) -> String {
@@ -46,7 +56,15 @@ impl ContextualUserFragment for CurrentTimeReminder {
     }
 
     fn body(&self) -> ContentItem {
-        input_text(format!("It is {}.", self.formatted_time()))
+        let mut body = format!("It is {}.", self.formatted_time());
+        if let Some(timing) = &self.conversation_timing {
+            body.push('\n');
+            body.push_str(&super::conversation_timing::render_conversation_timing(
+                self.current_time,
+                timing,
+            ));
+        }
+        input_text(body)
     }
 }
 
