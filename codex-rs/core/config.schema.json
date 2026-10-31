@@ -1683,6 +1683,10 @@
         "enabled": {
           "type": "boolean"
         },
+        "include_conversation_timing": {
+          "description": "Include recent conversation event timestamps in current-time reminders.",
+          "type": "boolean"
+        },
         "reminder_interval_seconds": {
           "format": "uint64",
           "minimum": 0.0,

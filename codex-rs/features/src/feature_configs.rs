@@ -476,6 +476,9 @@ pub struct CurrentTimeReminderConfigToml {
     pub clock_source: Option<CurrentTimeSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<CurrentTimeReminderDeliveryMode>,
+    /// Include recent conversation event timestamps in current-time reminders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_conversation_timing: Option<bool>,
     /// Expose the input-interruptible `clock.sleep` tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sleep_tool: Option<bool>,
@@ -601,5 +604,31 @@ pub struct AsyncCompactionConfigToml {
 impl FeatureConfig for AsyncCompactionConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CurrentTimeReminderConfigToml;
+
+    #[test]
+    fn current_time_reminder_round_trips_conversation_timing_opt_in() {
+        for (setting, expected) in [
+            ("include_conversation_timing = true", Some(true)),
+            ("include_conversation_timing = false", Some(false)),
+            ("", None),
+        ] {
+            let input = format!("enabled = true\n{setting}\n");
+            let config: CurrentTimeReminderConfigToml =
+                toml::from_str(&input).expect("conversation timing configuration should parse");
+            let serialized =
+                toml::Value::try_from(&config).expect("configuration should serialize to TOML");
+            assert_eq!(
+                serialized
+                    .get("include_conversation_timing")
+                    .and_then(toml::Value::as_bool),
+                expected,
+            );
+        }
     }
 }

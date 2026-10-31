@@ -258,6 +258,7 @@ mod reasoning_effort;
 mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::Submission;
+mod conversation_timing;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -3851,6 +3852,38 @@ impl Session {
         model_info: &ModelInfo,
         items: &[ResponseItem],
     ) {
+        self.record_conversation_items_with_timing(turn_context, model_info, items, None)
+            .await;
+    }
+
+    /// Capture completed model messages at the streaming boundary, not synthetic history edits.
+    pub(crate) async fn record_completed_model_item(
+        &self,
+        turn_context: &TurnContext,
+        model_info: &ModelInfo,
+        item: &ResponseItem,
+    ) {
+        let timing = if matches!(item, ResponseItem::Message { role, .. } if role == "assistant") {
+            self.capture_conversation_time(turn_context).await
+        } else {
+            None
+        };
+        self.record_conversation_items_with_timing(
+            turn_context,
+            model_info,
+            std::slice::from_ref(item),
+            timing,
+        )
+        .await;
+    }
+
+    async fn record_conversation_items_with_timing(
+        &self,
+        turn_context: &TurnContext,
+        model_info: &ModelInfo,
+        items: &[ResponseItem],
+        timing: Option<time_reminder::ConversationTimeCapture>,
+    ) {
         let (items, image_preparations) = self
             .prepare_conversation_items_for_history(turn_context, model_info, items)
             .await;
@@ -3864,6 +3897,7 @@ impl Session {
             model_info,
             items,
             image_preparations,
+            timing,
         )
         .await;
     }
@@ -3874,6 +3908,7 @@ impl Session {
         model_info: &ModelInfo,
         mut items: Vec<ResponseItemEnvelope>,
         image_preparations: Vec<ImagePreparationMetadata>,
+        timing: Option<time_reminder::ConversationTimeCapture>,
     ) {
         // Save the originating history budget for replay.
         // Preserve any existing tool-specific override.
@@ -3923,6 +3958,30 @@ impl Session {
             .collect::<Vec<_>>();
         {
             let mut state = self.state.lock().await;
+            if let Some(timing) = timing {
+                let mut snapshot = conversation_timing::with_clock_source(
+                    conversation_timing::recover(state.history.annotated_items()),
+                    timing.clock_source,
+                );
+                for envelope in &mut items {
+                    let event = codex_history::ConversationMessageTiming {
+                        message_id: envelope.item.id().map(|id| id.as_str().to_string()),
+                        at_ms: timing.at_ms,
+                    };
+                    if conversation_timing::is_human_message(&envelope.item) {
+                        snapshot.last_user_message = Some(event);
+                    } else if matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "assistant")
+                    {
+                        snapshot.last_assistant_message = Some(event);
+                    } else {
+                        continue;
+                    }
+                    envelope
+                        .metadata
+                        .get_or_insert_default()
+                        .conversation_timing = Some(snapshot.clone());
+                }
+            }
             state
                 .current_time_reminder
                 .note_recorded_items(&response_items);
@@ -4534,7 +4593,20 @@ impl Session {
             let complete_replacement =
                 matches!(&installation, CompactedHistoryInstallation::Complete(_));
             let (metadata, started_item) = match installation {
-                CompactedHistoryInstallation::Complete(metadata) => (metadata, None),
+                CompactedHistoryInstallation::Complete(metadata) => {
+                    if state.history.annotated_items().iter().any(|envelope| {
+                        envelope
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|metadata| metadata.conversation_timing.is_some())
+                    }) && let Some(last) = items.last_mut()
+                    {
+                        last.metadata.get_or_insert_default().conversation_timing = Some(
+                            conversation_timing::recover(state.history.annotated_items()),
+                        );
+                    }
+                    (metadata, None)
+                }
                 CompactedHistoryInstallation::Prefix {
                     prefix,
                     prefix_context,
@@ -4554,6 +4626,17 @@ impl Session {
                         return false;
                     }
                     let current = state.history.annotated_items();
+                    // Checkpoint only the replaced prefix. A live suffix may later be rolled back.
+                    if current[..prefix.len].iter().any(|envelope| {
+                        envelope
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|metadata| metadata.conversation_timing.is_some())
+                    }) && let Some(last) = items.last_mut()
+                    {
+                        last.metadata.get_or_insert_default().conversation_timing =
+                            Some(conversation_timing::recover(&current[..prefix.len]));
+                    }
                     let suffix = &current[prefix.len..];
                     if suffix.iter().any(|envelope| {
                         crate::compact_retained_tool_outputs::is_retained_tool_output(envelope)
@@ -5623,11 +5706,17 @@ impl Session {
             &prepared_items,
             &user_image_content_indices,
         );
+        let timing = if metadata.origin != codex_history::UserInputOrigin::Heartbeat {
+            self.capture_conversation_time(turn_context).await
+        } else {
+            None
+        };
         self.record_prepared_conversation_items(
             turn_context,
             model_info,
             prepared_items,
             image_preparations,
+            timing,
         )
         .await;
         user_message_item.client_id = client_id;

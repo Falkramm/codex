@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use chrono::DateTime;
 use chrono::Utc;
 use codex_features::CurrentTimeReminderDeliveryMode;
+use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -13,6 +16,20 @@ use crate::config::CurrentTimeReminderConfig;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeUnavailable;
 use crate::context_manager::is_user_turn_boundary;
+
+const CONVERSATION_TIME_CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
+
+pub(super) struct ConversationTimeCapture {
+    pub(super) clock_source: &'static str,
+    pub(super) at_ms: Option<i64>,
+}
+
+fn clock_source_name(source: CurrentTimeSource) -> &'static str {
+    match source {
+        CurrentTimeSource::System => "system",
+        CurrentTimeSource::External => "external",
+    }
+}
 
 pub(super) fn apply_persistent_defaults(config: &mut Config) {
     if config.current_time_reminder.is_some()
@@ -97,6 +114,38 @@ impl CurrentTimeReminderState {
 }
 
 impl Session {
+    pub(super) async fn capture_conversation_time(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Option<ConversationTimeCapture> {
+        let config = turn_context.config.current_time_reminder?;
+        if !config.include_conversation_timing
+            || !turn_context
+                .config
+                .features
+                .enabled(Feature::CurrentTimeReminder)
+        {
+            return None;
+        }
+        // Bound optional clock reads so accepted input and completed answers reach history.
+        let at_ms = match tokio::time::timeout(
+            CONVERSATION_TIME_CAPTURE_TIMEOUT,
+            self.services.time_provider.current_time(self.thread_id),
+        )
+        .await
+        {
+            Ok(Ok(time)) => Some(time.timestamp_millis()),
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(thread_id = %self.thread_id, "conversation event time unavailable or timed out");
+                None
+            }
+        };
+        Some(ConversationTimeCapture {
+            clock_source: clock_source_name(config.clock_source),
+            at_ms,
+        })
+    }
+
     pub(super) async fn read_clock_for_context(
         &self,
         turn_context: &TurnContext,
@@ -189,8 +238,16 @@ pub(super) async fn maybe_record_current_time_reminder(
         return Ok(());
     }
 
-    let response_item =
-        ContextualUserFragment::into(crate::context::CurrentTimeReminder::new(current_time));
+    let mut reminder = crate::context::CurrentTimeReminder::new(current_time);
+    if config.include_conversation_timing {
+        let state = sess.state.lock().await;
+        let timing = super::conversation_timing::with_clock_source(
+            super::conversation_timing::recover(state.history.annotated_items()),
+            clock_source_name(config.clock_source),
+        );
+        reminder = reminder.with_conversation_timing(timing);
+    }
+    let response_item = ContextualUserFragment::into(reminder);
     sess.record_conversation_items(
         turn_context,
         turn_context.model_info(),

@@ -381,7 +381,7 @@ impl OutgoingMessageSender {
         .await
     }
 
-    fn next_request_id(&self) -> RequestId {
+    pub(crate) fn next_request_id(&self) -> RequestId {
         RequestId::Integer(self.next_server_request_id.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -392,6 +392,19 @@ impl OutgoingMessageSender {
         thread_id: Option<ThreadId>,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         let id = self.next_request_id();
+        self.send_request_to_connections_with_id(id, connection_ids, request, thread_id)
+            .await
+    }
+
+    /// Send with an ID reserved by `next_request_id`, allowing the caller to
+    /// install cancellation cleanup before callback registration or queue waits.
+    pub(crate) async fn send_request_to_connections_with_id(
+        &self,
+        id: RequestId,
+        connection_ids: Option<&[ConnectionId]>,
+        request: ServerRequestPayload,
+        thread_id: Option<ThreadId>,
+    ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
         let user_verification = matches!(
@@ -1075,6 +1088,51 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_current_time_request_during_backpressure_removes_pending_callback() {
+        let (tx, mut rx) = mpsc::channel(1);
+        // Occupy the only queue slot so the request registers its callback but
+        // cannot finish sending or return its request ID to the provider.
+        let permit = tx.reserve().await.unwrap();
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx.clone(),
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_state_manager = crate::thread_state::ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(7);
+        thread_state_manager
+            .connection_initialized(
+                connection_id,
+                crate::thread_state::ConnectionCapabilities::default(),
+            )
+            .await;
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, connection_id)
+                .await
+        );
+        let provider = crate::current_time::app_server_time_provider(
+            Arc::clone(&outgoing),
+            thread_state_manager,
+        );
+        let mut request = provider.current_time(thread_id);
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(outgoing.request_id_to_callback.lock().await.len(), 1);
+
+        drop(request);
+        drop(permit);
+        tokio::task::yield_now().await;
+        assert!(
+            outgoing.request_id_to_callback.lock().await.is_empty(),
+            "canceling a backpressured clock request must remove its registered callback"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the canceled request must not be sent"
+        );
+    }
 
     #[test]
     fn verify_server_notification_serialization() {

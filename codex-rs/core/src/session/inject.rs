@@ -160,6 +160,7 @@ impl Session {
             model_info,
             annotated_items,
             image_preparations,
+            None,
         )
         .await;
     }
